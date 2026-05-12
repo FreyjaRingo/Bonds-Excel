@@ -4,6 +4,9 @@ import pandas as pd
 import io
 import numpy_financial as npf
 
+# Konfigurasi agar halaman tampil full-width (lebar penuh)
+st.set_page_config(layout="wide", page_title="PDF Table Extractor & Editor")
+
 st.title("PDF Table Extractor & Editor")
 
 uploaded_file = st.file_uploader("Unggah file PDF Excel", type="pdf")
@@ -104,8 +107,6 @@ if uploaded_file is not None:
                     df['year maturity'] = df[maturity_col].apply(extract_year)
                 
                 # 3, 4, 5. Kolom Persentase (Kupon %, Y MBI Beli, Y MBI Jual)
-                # Di Streamlit kita simpan sebagai string dengan '%' agar visualnya cantik.
-                # Nanti saat akan di-download ke Excel, baru kita ubah jadi float desimal murni.
                 def to_percent_str(val):
                     try:
                         if pd.isna(val): return None
@@ -122,7 +123,8 @@ if uploaded_file is not None:
                 
                 if 'yield_mbi_jual' in df.columns:
                     df['y mbi jual'] = df['yield_mbi_jual'].apply(to_percent_str)
-                # 6. Kolom MDURATION (Dihitung dengan QuantLib untuk tampilan)
+                
+                # 6. Kolom MDURATION 
                 st.write("---")
                 st.subheader("Pengaturan Parameter Simulasi")
                 
@@ -142,7 +144,6 @@ if uploaded_file is not None:
                     try:
                         import QuantLib as ql
                         
-                        # Gunakan kolom sesuai referensi Excel: H5 (Maturity), M5 (kupon %), O5 (y mbi jual)
                         mat_val = row.get('Maturity') if 'Maturity' in row else (row.get(maturity_col) if maturity_col else None)
                         kup_val = row.get('kupon %')
                         yld_val = row.get('y mbi jual')
@@ -156,31 +157,26 @@ if uploaded_file is not None:
                         if pd.isna(maturity_date) or maturity_date <= settlement_dt:
                             return None
                             
-                        # Parse angka persentase string (misal '5.9%') menjadi rate desimal asli (0.059)
                         def parse_to_rate(r):
                             return float(str(r).replace('%', '').replace(',', '.')) / 100.0
                             
                         c = parse_to_rate(kup_val)
                         y = parse_to_rate(yld_val)
                         
-                        # Setup QuantLib
                         set_date_ql = ql.Date(settlement_dt.day, settlement_dt.month, settlement_dt.year)
                         mat_date_ql = ql.Date(maturity_date.day, maturity_date.month, maturity_date.year)
                         
                         ql.Settings.instance().evaluationDate = set_date_ql
                         
                         calendar = ql.NullCalendar()
-                        day_count = ql.ActualActual(ql.ActualActual.ISMA) # Setara dengan Basis 1 di Excel
+                        day_count = ql.ActualActual(ql.ActualActual.ISMA) 
                         q_freq = ql.Semiannual
                         
-                        # Schedule iterasi cashflow (dibentuk mundur dari maturity)
                         schedule = ql.Schedule(set_date_ql, mat_date_ql, ql.Period(q_freq), calendar,
                                                ql.Unadjusted, ql.Unadjusted, ql.DateGeneration.Backward, False)
                         
-                        # Konstruksi Fixed Rate Bond
                         bond = ql.FixedRateBond(0, 100.0, schedule, [c], day_count)
                         
-                        # Hitung durasi berdasarkan yield
                         interest_rate = ql.InterestRate(y, day_count, ql.Compounded, q_freq)
                         mod_dur = ql.BondFunctions.duration(bond, interest_rate, ql.Duration.Modified)
                         
@@ -194,13 +190,11 @@ if uploaded_file is not None:
                 def hitung_rate_impact(val, is_hike=False):
                     try:
                         if pd.isna(val): return None
-                        # Convert persentase string (misal '1.524%') jadi desimal
                         v = float(str(val).replace('%', '').replace(',', '.')) / 100.0
                         
-                        # Dikalikan dengan cut rate desimal
                         result = v * (cut_rate_input / 100.0) 
                         if is_hike:
-                            result = -result # Rate hike diberi tanda minus
+                            result = -result 
                             
                         return round(result, 6)
                     except:
@@ -209,7 +203,6 @@ if uploaded_file is not None:
                 df['Rate Hike'] = df['y mbi jual'].apply(lambda x: hitung_rate_impact(x, is_hike=True))
                 df['Rate Cut'] = df['y mbi jual'].apply(lambda x: hitung_rate_impact(x, is_hike=False))
 
-                # Pastikan menggunakan nama kolom yang benar: mbi_jual (dengan underscore)
                 if 'mbi_jual' in df.columns:
                     df['Rate Hike Price'] = df['mbi_jual'] + (df['Rate Hike'] * df['mbi_jual'])
                 else:
@@ -219,7 +212,7 @@ if uploaded_file is not None:
                     df['Rate Cut Price'] = df['mbi_jual'] + (df['Rate Cut'] * df['mbi_jual'])
                 else:
                     df['Rate Cut Price'] = None
-                # (Variabel Hari Ini digunakan di balik layar berdasarkan input UI)
+                
                 base_date_pd = pd.to_datetime(base_date_input)
                 
                 # Kolom Total Year to Maturity
@@ -227,7 +220,6 @@ if uploaded_file is not None:
                     mat = row.get('Maturity') if 'Maturity' in row else row.get(maturity_col)
                     if pd.isna(mat): return None
                     try:
-                        # Hitung selisih hari dibagi 365.25 (untuk memperhitungkan tahun kabisat)
                         diff = (pd.to_datetime(mat) - base_date_pd.normalize()).days / 365.25
                         return round(diff, 4)
                     except:
@@ -245,7 +237,6 @@ if uploaded_file is not None:
                         if pd.isna(y_mbi) or pd.isna(kupon) or pd.isna(ytm_years):
                             return None
                         
-                        # Jika hike: rate bertambah. Jika cut: rate berkurang.
                         if is_hike:
                             rate = y_mbi + (yield_hike_input / 100.0)
                         else:
@@ -255,7 +246,6 @@ if uploaded_file is not None:
                         pmt = 100 * kupon
                         fv = 100
                         
-                        # PV formula *-1
                         price = -npf.pv(rate, nper, pmt, fv, when=0)
                         return round(price, 4)
                     except:
@@ -264,34 +254,27 @@ if uploaded_file is not None:
                 df['Price if Yield Hike'] = df.apply(lambda r: hitung_price_pv(r, is_hike=True), axis=1)
                 df['Price if Yield Cut'] = df.apply(lambda r: hitung_price_pv(r, is_hike=False), axis=1)
 
-                #st.write("Daftar Kolom:", list(df.columns))
-                
                 st.write("Edit data langsung pada tabel di bawah:")
-                # Render DataFrame ke editor interaktif
-                edited_df = st.data_editor(df, num_rows="dynamic")
                 
-                # --- PERSIAPAN DOWNLOAD EXCEL ---
-                # Salin dataframe hasil edit agar kita bisa menimpa kolom MDURATION dengan formula Excel
+                # Memastikan tabel memanfaatkan seluruh lebar kontainer
+                edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
+                
                 excel_df = edited_df.copy()
 
                 # --- VISUALISASI YIELD CURVE BENCHMARK ---
                 st.write("---")
                 
-                # Gunakan data dari edited_df agar jika ada yang diedit di tabel, grafiknya ikut berubah
                 if 'product_code' in edited_df.columns and 'year maturity' in edited_df.columns and 'y mbi jual' in edited_df.columns:
                     
-                    # Tambahkan filter mata uang (radio button horizontal)
                     if 'currency check' in edited_df.columns:
                         available_currencies = ["Semua"] + edited_df['currency check'].dropna().unique().tolist()
                         selected_currency = st.radio("Filter Mata Uang Grafik:", options=available_currencies, horizontal=True)
                     else:
                         selected_currency = "Semua"
 
-                    # Buat judul grafik dinamis
                     chart_title = f"Bonds Chart {selected_currency if selected_currency != 'Semua' else ''} - Mark to Market".replace("  ", " ")
                     st.subheader(chart_title)
                     
-                    # Terapkan filter mata uang jika bukan "Semua"
                     filtered_df_for_chart = edited_df.copy()
                     if selected_currency != "Semua" and 'currency check' in filtered_df_for_chart.columns:
                         filtered_df_for_chart = filtered_df_for_chart[filtered_df_for_chart['currency check'] == selected_currency]
@@ -304,11 +287,9 @@ if uploaded_file is not None:
                         default=[]
                     )
                     
-                    # Persiapkan data chart
                     chart_df = filtered_df_for_chart.copy()
                     chart_df['Year Numeric'] = pd.to_numeric(chart_df['year maturity'], errors='coerce')
                     
-                    # Konversi yield y mbi jual (bisa string "5.5%" atau float)
                     def parse_yield_chart(val):
                         try:
                             return float(str(val).replace('%', '').replace(',', '.'))
@@ -316,7 +297,6 @@ if uploaded_file is not None:
                             return None
                     chart_df['Yield Numeric'] = chart_df['y mbi jual'].apply(parse_yield_chart)
                     
-                    # Buang baris yang tidak memiliki X atau Y valid
                     chart_df = chart_df.dropna(subset=['Year Numeric', 'Yield Numeric'])
                     
                     if not chart_df.empty:
@@ -324,7 +304,7 @@ if uploaded_file is not None:
                         
                         fig = go.Figure()
                         
-                        # 1. Scatter Plot (Semua Obligasi)
+                        # 1. Scatter Plot
                         fig.add_trace(go.Scatter(
                             x=chart_df['Year Numeric'],
                             y=chart_df['Yield Numeric'],
@@ -333,7 +313,7 @@ if uploaded_file is not None:
                             text=chart_df['product_code'],
                             textposition="top right",
                             marker=dict(size=8, color='#5D9CEC'),
-                            textfont=dict(color='black', size=10) # <--- TAMBAHKAN BARIS INI
+                            textfont=dict(color='black', size=10) 
                         ))
                         
                         # 2. Line Plot (Benchmark Curve)
@@ -351,12 +331,13 @@ if uploaded_file is not None:
                             ))
                             
                             st.write("**Tabel Ringkasan Benchmark**")
-                            # Tabel rekap seperti di Excel
                             summary_df = bench_df[['product_code', 'year maturity', 'y mbi jual']].copy()
                             summary_df.columns = ['Benchmark', 'Year', 'Yield']
-                            st.dataframe(summary_df, hide_index=True)
                             
-                        # Layout 
+                            # Memastikan tabel rekap menggunakan seluruh lebar layar
+                            st.dataframe(summary_df, hide_index=True, use_container_width=True)
+                            
+                        # Layout Diperbaiki agar rapi saat ditarik full layar
                         fig.update_layout(
                             xaxis_title="Year",
                             yaxis_title="Yield (% MBI Jual)",
@@ -364,7 +345,9 @@ if uploaded_file is not None:
                             yaxis=dict(tickformat=".2f", ticksuffix="%"),
                             height=600,
                             plot_bgcolor='white',
-                            showlegend=True
+                            showlegend=True,
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), # Legenda diletakkan di atas
+                            margin=dict(l=20, r=20, t=40, b=20)
                         )
                         
                         fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
@@ -372,7 +355,7 @@ if uploaded_file is not None:
                         
                         st.plotly_chart(fig, use_container_width=True)
                 
-                # Ubah kolom persentase (yang tadinya format string "5.9%") jadi float murni (0.059) khusus untuk Excel
+                # --- PERSIAPAN DOWNLOAD EXCEL ---
                 def clean_for_excel(val):
                     try:
                         return float(str(val).replace('%', '').replace(',', '.')) / 100.0
@@ -383,20 +366,14 @@ if uploaded_file is not None:
                     if c in excel_df.columns:
                         excel_df[c] = excel_df[c].apply(clean_for_excel)
                 
-                # Menggunakan indeks baris excel (dimulai dari baris 2 karena header di baris 1)
-                # Koma digunakan sebagai pemisah argumen formula standar Excel di openpyxl
                 excel_df['MDURATION'] = [f"=MDURATION($Y$4, H{i+2}, M{i+2}, O{i+2}, 2, 1)" for i in range(len(excel_df))]
                 excel_df['Rate Hike'] = [f"=-O{i+2} * {cut_rate_input/100.0}" for i in range(len(excel_df))]
                 excel_df['Rate Cut']  = [f"=O{i+2} * {cut_rate_input/100.0}" for i in range(len(excel_df))]
                 excel_df['Rate Hike Price'] = [f"=Q{i+2} * E{i+2}" for i in range(len(excel_df))]
                 
-                # Formula excel Price if Yield Change 
-                # =PV((O5 + input); U5; (100*M5); 100; 0)*-1
-                # (Catatan: Total Year to Maturity di sistem kita ada di kolom U)
                 excel_df['Price if Yield Hike'] = [f"=-PV((O{i+2}+{yield_hike_input/100.0}), U{i+2}, (100*M{i+2}), 100, 0)" for i in range(len(excel_df))]
                 excel_df['Price if Yield Cut']  = [f"=-PV((O{i+2}-{yield_cut_input/100.0}), U{i+2}, (100*M{i+2}), 100, 0)" for i in range(len(excel_df))]
                 
-                # Siapkan file Excel untuk diunduh
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     excel_df.to_excel(writer, index=False, sheet_name='Sheet1')
