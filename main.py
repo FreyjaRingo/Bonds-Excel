@@ -1,8 +1,120 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pdfplumber
 import pandas as pd
 import io
+import html
+import re
 import numpy_financial as npf
+from openpyxl.utils import get_column_letter
+
+
+USD_PREFIXES = ("INDON", "INDOIS")
+
+
+def normalize_column_name(col, idx):
+    if pd.isna(col):
+        return f"_unnamed_{idx}"
+
+    name = str(col).replace("\n", "").replace("\r", "").strip()
+    return name or f"_unnamed_{idx}"
+
+
+def normalize_columns(columns):
+    normalized = []
+    seen = {}
+
+    for idx, col in enumerate(columns, start=1):
+        name = normalize_column_name(col, idx)
+        seen[name] = seen.get(name, 0) + 1
+        if seen[name] > 1:
+            name = f"{name}_{seen[name]}"
+        normalized.append(name)
+
+    return normalized
+
+
+def drop_repeated_header_rows(df):
+    normalized_headers = [str(c).strip().lower() for c in df.columns]
+
+    def looks_like_header(row):
+        row_values = [str(v).replace("\n", "").replace("\r", "").strip().lower() for v in row.tolist()]
+        return row_values == normalized_headers
+
+    return df[~df.apply(looks_like_header, axis=1)].reset_index(drop=True)
+
+
+def clean_numeric(val):
+    if pd.isna(val) or val == "":
+        return val
+
+    if not isinstance(val, str):
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return val
+
+    s = re.sub(r"\s+", "", val.strip())
+    if s in ("", "-"):
+        return val
+
+    is_percent = "%" in s
+    s = s.replace("%", "")
+
+    if not all(c in "0123456789.,-" for c in s):
+        return val
+
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        if s.count(",") > 1:
+            s = s.replace(",", "")
+        else:
+            parts = s.split(",")
+            if len(parts[-1]) == 3:
+                s = s.replace(",", "")
+            else:
+                s = s.replace(",", ".")
+
+    try:
+        v = float(s)
+        return v / 100.0 if is_percent else v
+    except ValueError:
+        return val
+
+
+def classify_currency(product_code):
+    if not isinstance(product_code, str):
+        return "IDR"
+
+    code = product_code.strip().upper()
+    return "US" if code.startswith(USD_PREFIXES) else "IDR"
+
+
+def to_percent_str(val):
+    try:
+        if pd.isna(val):
+            return None
+        return f"{round(float(val), 6)}%"
+    except (TypeError, ValueError):
+        return val
+
+
+def parse_percent_rate(val):
+    try:
+        if pd.isna(val):
+            return None
+        return float(str(val).replace("%", "").replace(",", ".")) / 100.0
+    except (TypeError, ValueError):
+        return None
+
+
+def excel_ref(df, column_name, row_number):
+    col_idx = df.columns.get_loc(column_name) + 1
+    return f"{get_column_letter(col_idx)}{row_number}"
 
 # Konfigurasi agar halaman tampil full-width (lebar penuh)
 st.set_page_config(layout="wide", page_title="PDF Table Extractor & Editor")
@@ -29,55 +141,13 @@ if uploaded_file is not None:
                 
                 df = pd.DataFrame(data, columns=header)
                 
-                # Bersihkan nama kolom dari karakter 'enter' (newline/carriage return)
-                df.columns = [str(col).replace('\n', '').replace('\r', '').strip() if pd.notna(col) else col for col in df.columns]
+                # Bersihkan nama kolom dari karakter 'enter' dan beri nama aman untuk kolom kosong.
+                df.columns = normalize_columns(df.columns)
+                df = drop_repeated_header_rows(df)
                 
                 # Tambah kolom kustom di sebelah kanan tabel
-                import re
                 
                 # --- PEMBERSIHAN DATA DAN KONVERSI TIPE ---
-                def clean_numeric(val):
-                    if pd.isna(val) or val == '': return val
-                    if not isinstance(val, str): return float(val)
-                    s = val.strip()
-                    # Buang spasi di antara angka (misal "1 000" atau "5 . 5" atau "4 75,000,000")
-                    s = re.sub(r'\s+', '', s)
-                    if s == '': return val
-                    
-                    # Deteksi kalau dia persentase
-                    is_percent = '%' in s
-                    s = s.replace('%', '')
-                    
-                    # Cek apakah berisi karakter angka (termasuk . , -)
-                    if not all(c in '0123456789.,-' for c in s):
-                        return val 
-                        
-                    # Handle format koma & titik
-                    if ',' in s and '.' in s:
-                        if s.rfind(',') > s.rfind('.'): # koma sebagai desimal
-                            s = s.replace('.', '').replace(',', '.')
-                        else: # koma sebagai ribuan
-                            s = s.replace(',', '')
-                    elif ',' in s:
-                        # Bisa jadi desimal (5,5) atau ribuan (475,000)
-                        if s.count(',') > 1:
-                            s = s.replace(',', '')
-                        else:
-                            # Jika hanya ada 1 koma, cek jumlah digit di belakangnya
-                            parts = s.split(',')
-                            if len(parts[-1]) == 3:
-                                s = s.replace(',', '') # Asumsi koma ribuan karena 3 digit tepat
-                            else:
-                                s = s.replace(',', '.') # Asumsi desimal
-                        
-                    try:
-                        v = float(s)
-                        if is_percent:
-                            v = v / 100.0
-                        return v
-                    except:
-                        return val
-
                 # Konversi semua kolom numerik utama agar jadi float asli
                 numeric_candidates = ['kupon', 'mbi_beli', 'mbi_jual', 'yield_mbi_beli', 'yield_mbi_jual', 'Inventory']
                 for c in numeric_candidates:
@@ -88,13 +158,11 @@ if uploaded_file is not None:
                 date_candidates = ['Maturity', 'Settlement date']
                 for c in date_candidates:
                     if c in df.columns:
-                        df[c] = pd.to_datetime(df[c], errors='ignore')
+                        df[c] = pd.to_datetime(df[c], errors='coerce')
 
                 # 1. Currency Check
                 if 'product_code' in df.columns:
-                    df['currency check'] = df['product_code'].apply(
-                        lambda x: 'US' if isinstance(x, str) and ('indon' in x.lower() or 'indois' in x.lower() or 'is' in x.lower() or 'in' in x.lower()) else 'IDR'
-                    )
+                    df['currency check'] = df['product_code'].apply(classify_currency)
                 
                 # 2. Year Maturity
                 maturity_col = next((col for col in df.columns if pd.notna(col) and 'maturity' in str(col).lower()), None)
@@ -107,22 +175,19 @@ if uploaded_file is not None:
                     df['year maturity'] = df[maturity_col].apply(extract_year)
                 
                 # 3, 4, 5. Kolom Persentase (Kupon %, Y MBI Beli, Y MBI Jual)
-                def to_percent_str(val):
-                    try:
-                        if pd.isna(val): return None
-                        v = round(float(val), 6)
-                        return f"{v}%"
-                    except:
-                        return val
-
                 if 'kupon' in df.columns:
                     df['kupon %'] = df['kupon'].apply(to_percent_str)
+                else:
+                    df['kupon %'] = None
                 
                 if 'yield_mbi_beli' in df.columns:
                     df['y mbi beli'] = df['yield_mbi_beli'].apply(to_percent_str)
                 
                 if 'yield_mbi_jual' in df.columns:
                     df['y mbi jual'] = df['yield_mbi_jual'].apply(to_percent_str)
+                else:
+                    df['y mbi jual'] = None
+                    st.warning("Kolom yield_mbi_jual tidak ditemukan; simulasi yield dan grafik akan kosong.")
                 
                 # 6. Kolom MDURATION 
                 st.write("---")
@@ -157,11 +222,10 @@ if uploaded_file is not None:
                         if pd.isna(maturity_date) or maturity_date <= settlement_dt:
                             return None
                             
-                        def parse_to_rate(r):
-                            return float(str(r).replace('%', '').replace(',', '.')) / 100.0
-                            
-                        c = parse_to_rate(kup_val)
-                        y = parse_to_rate(yld_val)
+                        c = parse_percent_rate(kup_val)
+                        y = parse_percent_rate(yld_val)
+                        if c is None or y is None:
+                            return None
                         
                         set_date_ql = ql.Date(settlement_dt.day, settlement_dt.month, settlement_dt.year)
                         mat_date_ql = ql.Date(maturity_date.day, maturity_date.month, maturity_date.year)
@@ -181,7 +245,7 @@ if uploaded_file is not None:
                         mod_dur = ql.BondFunctions.duration(bond, interest_rate, ql.Duration.Modified)
                         
                         return round(mod_dur, 4)
-                    except:
+                    except Exception:
                         return None
 
                 df['MDURATION'] = df.apply(hitung_mduration_ql, axis=1)
@@ -190,27 +254,27 @@ if uploaded_file is not None:
                 def hitung_rate_impact(val, is_hike=False):
                     try:
                         if pd.isna(val): return None
-                        v = float(str(val).replace('%', '').replace(',', '.')) / 100.0
+                        v = parse_percent_rate(val)
+                        if v is None:
+                            return None
                         
                         result = v * (cut_rate_input / 100.0) 
                         if is_hike:
                             result = -result 
                             
                         return round(result, 6)
-                    except:
+                    except Exception:
                         return None
                         
                 df['Rate Hike'] = df['y mbi jual'].apply(lambda x: hitung_rate_impact(x, is_hike=True))
                 df['Rate Cut'] = df['y mbi jual'].apply(lambda x: hitung_rate_impact(x, is_hike=False))
 
                 if 'mbi_jual' in df.columns:
-                    df['Rate Hike Price'] = df['mbi_jual'] + (df['Rate Hike'] * df['mbi_jual'])
+                    mbi_jual_num = pd.to_numeric(df['mbi_jual'], errors='coerce')
+                    df['Rate Hike Price'] = mbi_jual_num + (df['Rate Hike'] * mbi_jual_num)
+                    df['Rate Cut Price'] = mbi_jual_num + (df['Rate Cut'] * mbi_jual_num)
                 else:
                     df['Rate Hike Price'] = None
-
-                if 'mbi_jual' in df.columns:
-                    df['Rate Cut Price'] = df['mbi_jual'] + (df['Rate Cut'] * df['mbi_jual'])
-                else:
                     df['Rate Cut Price'] = None
                 
                 base_date_pd = pd.to_datetime(base_date_input)
@@ -230,8 +294,8 @@ if uploaded_file is not None:
                 # Kolom Price menggunakan formula PV
                 def hitung_price_pv(row, is_hike=True):
                     try:
-                        y_mbi = float(str(row.get('y mbi jual', '0')).replace('%', '').replace(',', '.')) / 100.0
-                        kupon = float(str(row.get('kupon %', '0')).replace('%', '').replace(',', '.')) / 100.0
+                        y_mbi = parse_percent_rate(row.get('y mbi jual'))
+                        kupon = parse_percent_rate(row.get('kupon %'))
                         ytm_years = row.get('Total Year to Maturity')
                         
                         if pd.isna(y_mbi) or pd.isna(kupon) or pd.isna(ytm_years):
@@ -248,7 +312,7 @@ if uploaded_file is not None:
                         
                         price = -npf.pv(rate, nper, pmt, fv, when=0)
                         return round(price, 4)
-                    except:
+                    except Exception:
                         return None
                         
                 df['Price if Yield Hike'] = df.apply(lambda r: hitung_price_pv(r, is_hike=True), axis=1)
@@ -258,7 +322,68 @@ if uploaded_file is not None:
                 
                 # Memastikan tabel memanfaatkan seluruh lebar kontainer
                 edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
-                
+
+                # --- TAMPILAN WARNA TABEL ---
+                st.write("Tabel dengan gradasi warna:")
+                year_col = next((c for c in edited_df.columns if "year" in str(c).lower()), None)
+
+                styled_df = edited_df.copy()
+                styler = styled_df.style
+
+                if year_col:
+                    styler = styler.background_gradient(
+                        subset=[year_col],
+                        cmap="Blues",
+                        gmap=pd.to_numeric(styled_df[year_col], errors="coerce")
+                    )
+
+                # Gelapkan sel numerik lain dengan gradasi abu-abu agar kontras lebih tinggi.
+                numeric_cols = [
+                    c for c in styled_df.columns
+                    if c != year_col and pd.api.types.is_numeric_dtype(styled_df[c])
+                ]
+                if numeric_cols:
+                    styler = styler.background_gradient(
+                        subset=numeric_cols,
+                        cmap="Greys"
+                    )
+
+                st.dataframe(styler, use_container_width=True, hide_index=True)
+
+                # --- COPY TABLE (PRODUCT_CODE SAMPAI INVENTORY) ---
+                copy_cols = []
+                if "product_code" in edited_df.columns and "Inventory" in edited_df.columns:
+                    start_idx = edited_df.columns.get_loc("product_code")
+                    end_idx = edited_df.columns.get_loc("Inventory")
+                    if start_idx <= end_idx:
+                        copy_cols = edited_df.columns[start_idx:end_idx + 1].tolist()
+
+                if copy_cols:
+                    copy_df = edited_df[copy_cols].copy()
+                    copy_text = copy_df.to_csv(index=False, sep="\t")
+                    escaped_copy_text = html.escape(copy_text)
+                    st.write("Copy tabel (kolom product_code sampai Inventory):")
+                    components.html(
+                        f"""
+                        <div style='display:flex; gap:8px; align-items:center;'>
+                          <button onclick='navigator.clipboard.writeText(document.getElementById("copy_area").value)'>Copy Table</button>
+                          <span id='copy_status' style='font-size:12px; color:#333;'></span>
+                        </div>
+                        <textarea id='copy_area' style='width:100%; height:160px; margin-top:8px;'>{escaped_copy_text}</textarea>
+                        <script>
+                          const btn = document.querySelector('button');
+                          const status = document.getElementById('copy_status');
+                          btn.addEventListener('click', () => {{
+                            status.textContent = 'Copied';
+                            setTimeout(() => status.textContent = '', 1500);
+                          }});
+                        </script>
+                        """,
+                        height=230,
+                    )
+                else:
+                    st.info("Kolom product_code atau Inventory tidak ditemukan untuk fitur copy.")
+
                 excel_df = edited_df.copy()
 
                 # --- VISUALISASI YIELD CURVE BENCHMARK ---
@@ -281,11 +406,21 @@ if uploaded_file is not None:
                         
                     valid_products = filtered_df_for_chart['product_code'].dropna().unique().tolist()
                     
-                    benchmark_selection = st.multiselect(
-                        "Pilih Seri Obligasi Benchmark",
-                        options=valid_products,
-                        default=[]
-                    )
+                    bench_col1, bench_col2 = st.columns(2)
+                    with bench_col1:
+                        benchmark_selection_1 = st.multiselect(
+                            "Pilih Seri Obligasi Benchmark 1",
+                            options=valid_products,
+                            default=[],
+                            key="benchmark_selection_1",
+                        )
+                    with bench_col2:
+                        benchmark_selection_2 = st.multiselect(
+                            "Pilih Seri Obligasi Benchmark 2",
+                            options=valid_products,
+                            default=[],
+                            key="benchmark_selection_2",
+                        )
                     
                     chart_df = filtered_df_for_chart.copy()
                     chart_df['Year Numeric'] = pd.to_numeric(chart_df['year maturity'], errors='coerce')
@@ -316,26 +451,40 @@ if uploaded_file is not None:
                             textfont=dict(color='black', size=10) 
                         ))
                         
-                        # 2. Line Plot (Benchmark Curve)
-                        if benchmark_selection:
-                            bench_df = chart_df[chart_df['product_code'].isin(benchmark_selection)].copy()
+                        # 2. Line Plot (Benchmark Curves)
+                        benchmark_configs = [
+                            ("Benchmark 1", benchmark_selection_1, "red"),
+                            ("Benchmark 2", benchmark_selection_2, "green"),
+                        ]
+
+                        summary_tables = []
+                        for bench_name, selected_products, color in benchmark_configs:
+                            if not selected_products:
+                                continue
+
+                            bench_df = chart_df[chart_df['product_code'].isin(selected_products)].copy()
                             bench_df = bench_df.sort_values(by='Year Numeric')
-                            
+
                             fig.add_trace(go.Scatter(
                                 x=bench_df['Year Numeric'],
                                 y=bench_df['Yield Numeric'],
                                 mode='lines+markers',
-                                name='Benchmark Curve',
-                                line=dict(color='red', width=3),
-                                marker=dict(size=10, color='red')
+                                name=f'{bench_name} Curve',
+                                line=dict(color=color, width=3),
+                                marker=dict(size=10, color=color)
                             ))
-                            
-                            st.write("**Tabel Ringkasan Benchmark**")
+
                             summary_df = bench_df[['product_code', 'year maturity', 'y mbi jual']].copy()
-                            summary_df.columns = ['Benchmark', 'Year', 'Yield']
-                            
-                            # Memastikan tabel rekap menggunakan seluruh lebar layar
-                            st.dataframe(summary_df, hide_index=True, use_container_width=True)
+                            summary_df.columns = [bench_name, 'Year', 'Yield']
+                            summary_tables.append((bench_name, summary_df))
+
+                        if summary_tables:
+                            st.write("**Tabel Ringkasan Benchmark**")
+                            summary_cols = st.columns(len(summary_tables))
+                            for idx, (bench_name, summary_df) in enumerate(summary_tables):
+                                with summary_cols[idx]:
+                                    st.write(f"**{bench_name}**")
+                                    st.dataframe(summary_df, hide_index=True, use_container_width=True)
                             
                         # Layout Diperbaiki agar rapi saat ditarik full layar
                         fig.update_layout(
@@ -357,26 +506,56 @@ if uploaded_file is not None:
                 
                 # --- PERSIAPAN DOWNLOAD EXCEL ---
                 def clean_for_excel(val):
-                    try:
-                        return float(str(val).replace('%', '').replace(',', '.')) / 100.0
-                    except:
-                        return val
+                    parsed = parse_percent_rate(val)
+                    return parsed if parsed is not None else val
                         
                 for c in ['kupon %', 'y mbi beli', 'y mbi jual']:
                     if c in excel_df.columns:
                         excel_df[c] = excel_df[c].apply(clean_for_excel)
                 
-                excel_df['MDURATION'] = [f"=MDURATION($Y$4, H{i+2}, M{i+2}, O{i+2}, 2, 1)" for i in range(len(excel_df))]
-                excel_df['Rate Hike'] = [f"=-O{i+2} * {cut_rate_input/100.0}" for i in range(len(excel_df))]
-                excel_df['Rate Cut']  = [f"=O{i+2} * {cut_rate_input/100.0}" for i in range(len(excel_df))]
-                excel_df['Rate Hike Price'] = [f"=Q{i+2} * E{i+2}" for i in range(len(excel_df))]
+                if {'Maturity', 'kupon %', 'y mbi jual'}.issubset(excel_df.columns):
+                    excel_df['MDURATION'] = [
+                        f"=MDURATION('_Parameters'!$B$1,{excel_ref(excel_df, 'Maturity', i+2)},{excel_ref(excel_df, 'kupon %', i+2)},{excel_ref(excel_df, 'y mbi jual', i+2)},2,1)"
+                        for i in range(len(excel_df))
+                    ]
+
+                if 'y mbi jual' in excel_df.columns:
+                    excel_df['Rate Hike'] = [
+                        f"=-{excel_ref(excel_df, 'y mbi jual', i+2)}*{cut_rate_input/100.0}"
+                        for i in range(len(excel_df))
+                    ]
+                    excel_df['Rate Cut'] = [
+                        f"={excel_ref(excel_df, 'y mbi jual', i+2)}*{cut_rate_input/100.0}"
+                        for i in range(len(excel_df))
+                    ]
+
+                if {'mbi_jual', 'Rate Hike', 'Rate Cut'}.issubset(excel_df.columns):
+                    excel_df['Rate Hike Price'] = [
+                        f"={excel_ref(excel_df, 'mbi_jual', i+2)}+({excel_ref(excel_df, 'Rate Hike', i+2)}*{excel_ref(excel_df, 'mbi_jual', i+2)})"
+                        for i in range(len(excel_df))
+                    ]
+                    excel_df['Rate Cut Price'] = [
+                        f"={excel_ref(excel_df, 'mbi_jual', i+2)}+({excel_ref(excel_df, 'Rate Cut', i+2)}*{excel_ref(excel_df, 'mbi_jual', i+2)})"
+                        for i in range(len(excel_df))
+                    ]
                 
-                excel_df['Price if Yield Hike'] = [f"=-PV((O{i+2}+{yield_hike_input/100.0}), U{i+2}, (100*M{i+2}), 100, 0)" for i in range(len(excel_df))]
-                excel_df['Price if Yield Cut']  = [f"=-PV((O{i+2}-{yield_cut_input/100.0}), U{i+2}, (100*M{i+2}), 100, 0)" for i in range(len(excel_df))]
+                if {'y mbi jual', 'Total Year to Maturity', 'kupon %'}.issubset(excel_df.columns):
+                    excel_df['Price if Yield Hike'] = [
+                        f"=-PV(({excel_ref(excel_df, 'y mbi jual', i+2)}+{yield_hike_input/100.0}),{excel_ref(excel_df, 'Total Year to Maturity', i+2)},(100*{excel_ref(excel_df, 'kupon %', i+2)}),100,0)"
+                        for i in range(len(excel_df))
+                    ]
+                    excel_df['Price if Yield Cut'] = [
+                        f"=-PV(({excel_ref(excel_df, 'y mbi jual', i+2)}-{yield_cut_input/100.0}),{excel_ref(excel_df, 'Total Year to Maturity', i+2)},(100*{excel_ref(excel_df, 'kupon %', i+2)}),100,0)"
+                        for i in range(len(excel_df))
+                    ]
                 
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     excel_df.to_excel(writer, index=False, sheet_name='Sheet1')
+                    params_sheet = writer.book.create_sheet("_Parameters")
+                    params_sheet["A1"] = "settlement_date"
+                    params_sheet["B1"] = pd.to_datetime(settlement_date).date()
+                    params_sheet.sheet_state = "hidden"
                 
                 st.download_button(
                     label="Unduh Data (Excel)",
