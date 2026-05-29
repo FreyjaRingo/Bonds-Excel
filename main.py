@@ -427,9 +427,30 @@ if uploaded_file is not None:
 
                 # --- TAMPILAN WARNA TABEL ---
                 st.write("Tabel dengan gradasi warna:")
+                col1, col2 = st.columns([1, 3])
+                with col1:
+                    price_threshold = st.number_input("Threshold Price", value=100.0, step=1.0)
+                with col2:
+                    usd_idr_filter = st.selectbox("Filter Mata Uang untuk Bonds:", options=["Semua", "IDR", "USD"], index=0)
+                
                 year_col = next((c for c in edited_df.columns if "year" in str(c).lower()), None)
 
                 styled_df = edited_df.copy()
+                
+                # Apply Filter  
+                if usd_idr_filter == "USD":
+                    styled_df = styled_df[styled_df['currency check'] == 'USD']
+                elif usd_idr_filter == "IDR":
+                    styled_df = styled_df[styled_df['currency check'] == 'IDR']
+                else:
+                    pass  # Semua, tidak perlu filter
+                
+                # Convert mbi_jual ke numeric untuk pengecekan threshold
+                styled_df['mbi_jual'] = pd.to_numeric(styled_df['mbi_jual'], errors='coerce')
+                
+                # Tampilkan produk yang dibawah threshold saja
+                styled_df = styled_df[styled_df['mbi_jual'] <= price_threshold]
+
                 styler = styled_df.style
 
                 if year_col:
@@ -440,15 +461,16 @@ if uploaded_file is not None:
                     )
 
                 # Gelapkan sel numerik lain dengan gradasi abu-abu agar kontras lebih tinggi.
-                numeric_cols = [
-                    c for c in styled_df.columns
-                    if c != year_col and pd.api.types.is_numeric_dtype(styled_df[c])
-                ]
-                if numeric_cols:
-                    styler = styler.background_gradient(
-                        subset=numeric_cols,
-                        cmap="Greys"
-                    )
+                # numeric_cols = [
+                #     c for c in styled_df.columns
+                #     if c != year_col and pd.api.types.is_numeric_dtype(styled_df[c])
+                # ]
+                # if numeric_cols:
+                #     styler = styler.background_gradient(
+                #         subset=numeric_cols,
+                #         cmap="Greys"
+                #     )
+                    
                 st.dataframe(styler, use_container_width=True, hide_index=True)
 
                 # --- COPY TABLE (PRODUCT_CODE SAMPAI INVENTORY) ---
