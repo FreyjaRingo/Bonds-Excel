@@ -10,6 +10,8 @@ from openpyxl.utils import get_column_letter
 
 
 USD_PREFIXES = ("INDON", "INDOIS")
+BENCHMARK_FONT_FAMILY = "arialblack"
+SYARIAH_PREFIXES = ("PBS", "SR", "ST", "INDOIS")
 
 
 def normalize_column_name(col, idx):
@@ -91,7 +93,75 @@ def classify_currency(product_code):
         return "IDR"
 
     code = product_code.strip().upper()
-    return "US" if code.startswith(USD_PREFIXES) else "IDR"
+    return "USD" if code.startswith(USD_PREFIXES) else "IDR"
+
+
+def currency_matches(series, currency):
+    if currency in ("US", "USD"):
+        return series.isin(["US", "USD"])
+    return series == currency
+
+
+def product_code_key(product_code):
+    return str(product_code).strip().upper()
+
+
+def is_benchmark_font(fontname):
+    font = str(fontname).replace("-", "").replace("_", "").lower()
+    return BENCHMARK_FONT_FAMILY in font
+
+
+def extract_bold_product_codes(pdf):
+    bold_codes = set()
+
+    for page in pdf.pages:
+        try:
+            words = page.extract_words(extra_attrs=["fontname"])
+        except Exception:
+            continue
+
+        for word in words:
+            text = str(word.get("text", "")).strip()
+            fontname = str(word.get("fontname", ""))
+
+            if not text or not is_benchmark_font(fontname):
+                continue
+            if text.lower() == "product_code" or word.get("top", 0) < 120:
+                continue
+            if word.get("x0", 999) > 100 or not re.search(r"[A-Za-z]", text):
+                continue
+
+            bold_codes.add(product_code_key(text))
+
+    return bold_codes
+
+
+def product_options_for_currency(df, currency):
+    if currency == "Semua" or "currency check" not in df.columns:
+        source_df = df
+    else:
+        source_df = df[currency_matches(df["currency check"], currency)]
+
+    return source_df["product_code"].dropna().unique().tolist()
+
+
+def classify_bond_type(product_code):
+    code = product_code_key(product_code)
+    return "Syariah" if code.startswith(SYARIAH_PREFIXES) else "Konvensional"
+
+
+def product_options_for_segment(df, currency, bond_type):
+    products = product_options_for_currency(df, currency)
+    return [product for product in products if classify_bond_type(product) == bond_type]
+
+
+def auto_benchmark_products(df, bold_product_codes, currency, bond_type=None):
+    return [
+        product
+        for product in product_options_for_currency(df, currency)
+        if product_code_key(product) in bold_product_codes
+        and (bond_type is None or classify_bond_type(product) == bond_type)
+    ]
 
 
 def to_percent_str(val):
@@ -116,6 +186,61 @@ def excel_ref(df, column_name, row_number):
     col_idx = df.columns.get_loc(column_name) + 1
     return f"{get_column_letter(col_idx)}{row_number}"
 
+
+def to_ql_date(date_value):
+    import QuantLib as ql
+
+    dt = pd.to_datetime(date_value)
+    return ql.Date(dt.day, dt.month, dt.year)
+
+
+def previous_coupon_date(settlement_ql, maturity_ql, frequency):
+    import QuantLib as ql
+
+    calendar = ql.NullCalendar()
+    tenor = ql.Period(frequency)
+    coupon_date = maturity_ql
+
+    while coupon_date > settlement_ql:
+        coupon_date = calendar.advance(coupon_date, -tenor, ql.Unadjusted)
+
+    return coupon_date
+
+
+def calculate_mduration(maturity_date, settlement_date, coupon_rate, yield_rate):
+    try:
+        import QuantLib as ql
+
+        maturity_dt = pd.to_datetime(maturity_date)
+        settlement_dt = pd.to_datetime(settlement_date)
+        if pd.isna(maturity_dt) or pd.isna(settlement_dt) or maturity_dt <= settlement_dt:
+            return None
+
+        settlement_ql = to_ql_date(settlement_dt)
+        maturity_ql = to_ql_date(maturity_dt)
+        frequency = ql.Semiannual
+        effective_ql = previous_coupon_date(settlement_ql, maturity_ql, frequency)
+
+        schedule = ql.Schedule(
+            effective_ql,
+            maturity_ql,
+            ql.Period(frequency),
+            ql.NullCalendar(),
+            ql.Unadjusted,
+            ql.Unadjusted,
+            ql.DateGeneration.Backward,
+            False,
+        )
+        day_count = ql.ActualActual(ql.ActualActual.ISMA, schedule)
+
+        ql.Settings.instance().evaluationDate = settlement_ql
+        bond = ql.FixedRateBond(0, 100.0, schedule, [coupon_rate], day_count)
+        interest_rate = ql.InterestRate(yield_rate, day_count, ql.Compounded, frequency)
+
+        return round(ql.BondFunctions.duration(bond, interest_rate, ql.Duration.Modified, settlement_ql), 4)
+    except Exception:
+        return None
+
 # Konfigurasi agar halaman tampil full-width (lebar penuh)
 st.set_page_config(layout="wide", page_title="PDF Table Extractor & Editor")
 
@@ -127,6 +252,7 @@ if uploaded_file is not None:
     try:
         with pdfplumber.open(uploaded_file) as pdf:
             all_rows = []
+            benchmark_product_codes = extract_bold_product_codes(pdf)
             
             # Ekstrak tabel dari semua halaman
             for page in pdf.pages:
@@ -158,7 +284,8 @@ if uploaded_file is not None:
                 date_candidates = ['Maturity', 'Settlement date']
                 for c in date_candidates:
                     if c in df.columns:
-                        df[c] = pd.to_datetime(df[c], errors='coerce')
+                        df[c] = pd.to_datetime(df[c], errors='coerce').dt.strftime('%d-%m-%Y')  # Keep only dd mm yyyy format (no hour); invalid values become NaN.
+                        
 
                 # 1. Currency Check
                 if 'product_code' in df.columns:
@@ -177,14 +304,17 @@ if uploaded_file is not None:
                 # 3, 4, 5. Kolom Persentase (Kupon %, Y MBI Beli, Y MBI Jual)
                 if 'kupon' in df.columns:
                     df['kupon %'] = df['kupon'].apply(to_percent_str)
+                    df.drop(columns=['kupon', 'Settlement date', '_unnamed_4'], inplace=True)
                 else:
                     df['kupon %'] = None
                 
                 if 'yield_mbi_beli' in df.columns:
                     df['y mbi beli'] = df['yield_mbi_beli'].apply(to_percent_str)
+                    df.drop(columns=['yield_mbi_beli'], inplace=True)
                 
                 if 'yield_mbi_jual' in df.columns:
                     df['y mbi jual'] = df['yield_mbi_jual'].apply(to_percent_str)
+                    df.drop(columns=['yield_mbi_jual'], inplace=True)
                 else:
                     df['y mbi jual'] = None
                     st.warning("Kolom yield_mbi_jual tidak ditemukan; simulasi yield dan grafik akan kosong.")
@@ -206,47 +336,19 @@ if uploaded_file is not None:
                     yield_cut_input = st.number_input("Yield Turun (%)", value=0.0, step=0.0100, format="%.4f")
                 
                 def hitung_mduration_ql(row):
-                    try:
-                        import QuantLib as ql
-                        
-                        mat_val = row.get('Maturity') if 'Maturity' in row else (row.get(maturity_col) if maturity_col else None)
-                        kup_val = row.get('kupon %')
-                        yld_val = row.get('y mbi jual')
-                        
-                        if pd.isna(mat_val) or pd.isna(kup_val) or pd.isna(yld_val):
-                            return None
-                        
-                        maturity_date = pd.to_datetime(mat_val)
-                        settlement_dt = pd.to_datetime(settlement_date)
-                        
-                        if pd.isna(maturity_date) or maturity_date <= settlement_dt:
-                            return None
-                            
-                        c = parse_percent_rate(kup_val)
-                        y = parse_percent_rate(yld_val)
-                        if c is None or y is None:
-                            return None
-                        
-                        set_date_ql = ql.Date(settlement_dt.day, settlement_dt.month, settlement_dt.year)
-                        mat_date_ql = ql.Date(maturity_date.day, maturity_date.month, maturity_date.year)
-                        
-                        ql.Settings.instance().evaluationDate = set_date_ql
-                        
-                        calendar = ql.NullCalendar()
-                        day_count = ql.ActualActual(ql.ActualActual.ISMA) 
-                        q_freq = ql.Semiannual
-                        
-                        schedule = ql.Schedule(set_date_ql, mat_date_ql, ql.Period(q_freq), calendar,
-                                               ql.Unadjusted, ql.Unadjusted, ql.DateGeneration.Backward, False)
-                        
-                        bond = ql.FixedRateBond(0, 100.0, schedule, [c], day_count)
-                        
-                        interest_rate = ql.InterestRate(y, day_count, ql.Compounded, q_freq)
-                        mod_dur = ql.BondFunctions.duration(bond, interest_rate, ql.Duration.Modified)
-                        
-                        return round(mod_dur, 4)
-                    except Exception:
+                    mat_val = row.get('Maturity') if 'Maturity' in row else (row.get(maturity_col) if maturity_col else None)
+                    kup_val = row.get('kupon %')
+                    yld_val = row.get('y mbi jual')
+
+                    if pd.isna(mat_val) or pd.isna(kup_val) or pd.isna(yld_val):
                         return None
+
+                    coupon_rate = parse_percent_rate(kup_val)
+                    yield_rate = parse_percent_rate(yld_val)
+                    if coupon_rate is None or yield_rate is None:
+                        return None
+
+                    return calculate_mduration(mat_val, settlement_date, coupon_rate, yield_rate)
 
                 df['MDURATION'] = df.apply(hitung_mduration_ql, axis=1)
 
@@ -347,7 +449,6 @@ if uploaded_file is not None:
                         subset=numeric_cols,
                         cmap="Greys"
                     )
-
                 st.dataframe(styler, use_container_width=True, hide_index=True)
 
                 # --- COPY TABLE (PRODUCT_CODE SAMPAI INVENTORY) ---
@@ -390,6 +491,7 @@ if uploaded_file is not None:
                 st.write("---")
                 
                 if 'product_code' in edited_df.columns and 'year maturity' in edited_df.columns and 'y mbi jual' in edited_df.columns:
+                    bold_product_codes = benchmark_product_codes
                     
                     if 'currency check' in edited_df.columns:
                         available_currencies = ["Semua"] + edited_df['currency check'].dropna().unique().tolist()
@@ -402,25 +504,48 @@ if uploaded_file is not None:
                     
                     filtered_df_for_chart = edited_df.copy()
                     if selected_currency != "Semua" and 'currency check' in filtered_df_for_chart.columns:
-                        filtered_df_for_chart = filtered_df_for_chart[filtered_df_for_chart['currency check'] == selected_currency]
+                        filtered_df_for_chart = filtered_df_for_chart[currency_matches(filtered_df_for_chart['currency check'], selected_currency)]
                         
                     valid_products = filtered_df_for_chart['product_code'].dropna().unique().tolist()
-                    
-                    bench_col1, bench_col2 = st.columns(2)
-                    with bench_col1:
-                        benchmark_selection_1 = st.multiselect(
-                            "Pilih Seri Obligasi Benchmark 1",
-                            options=valid_products,
-                            default=[],
-                            key="benchmark_selection_1",
+
+                    benchmark_inputs = []
+                    if selected_currency in ("Semua", "IDR"):
+                        benchmark_inputs = [
+                            (
+                                "Benchmark IDR Konvensional",
+                                product_options_for_segment(edited_df, "IDR", "Konvensional"),
+                                auto_benchmark_products(edited_df, bold_product_codes, "IDR", "Konvensional"),
+                                "red",
+                            ),
+                            (
+                                "Benchmark IDR Syariah",
+                                product_options_for_segment(edited_df, "IDR", "Syariah"),
+                                auto_benchmark_products(edited_df, bold_product_codes, "IDR", "Syariah"),
+                                "green",
+                            ),
+                        ]
+                    if selected_currency in ("Semua", "USD", "US"):
+                        benchmark_inputs.append(
+                            (
+                                "Benchmark USD",
+                                product_options_for_currency(edited_df, "USD"),
+                                auto_benchmark_products(edited_df, bold_product_codes, "USD"),
+                                "orange",
+                            )
                         )
-                    with bench_col2:
-                        benchmark_selection_2 = st.multiselect(
-                            "Pilih Seri Obligasi Benchmark 2",
-                            options=valid_products,
-                            default=[],
-                            key="benchmark_selection_2",
-                        )
+
+                    benchmark_configs = []
+                    if benchmark_inputs:
+                        bench_cols = st.columns(len(benchmark_inputs))
+                        for idx, (label, options, default, color) in enumerate(benchmark_inputs):
+                            with bench_cols[idx]:
+                                benchmark_selection = st.multiselect(
+                                    f"Pilih Seri Obligasi {label}",
+                                    options=options,
+                                    default=default,
+                                    key=f"benchmark_selection_{idx}_{selected_currency}",
+                                )
+                                benchmark_configs.append((label, benchmark_selection, color))
                     
                     chart_df = filtered_df_for_chart.copy()
                     chart_df['Year Numeric'] = pd.to_numeric(chart_df['year maturity'], errors='coerce')
@@ -452,11 +577,6 @@ if uploaded_file is not None:
                         ))
                         
                         # 2. Line Plot (Benchmark Curves)
-                        benchmark_configs = [
-                            ("Benchmark 1", benchmark_selection_1, "red"),
-                            ("Benchmark 2", benchmark_selection_2, "green"),
-                        ]
-
                         summary_tables = []
                         for bench_name, selected_products, color in benchmark_configs:
                             if not selected_products:
@@ -515,7 +635,7 @@ if uploaded_file is not None:
                 
                 if {'Maturity', 'kupon %', 'y mbi jual'}.issubset(excel_df.columns):
                     excel_df['MDURATION'] = [
-                        f"=MDURATION('_Parameters'!$B$1,{excel_ref(excel_df, 'Maturity', i+2)},{excel_ref(excel_df, 'kupon %', i+2)},{excel_ref(excel_df, 'y mbi jual', i+2)},2,1)"
+                        f"=IFERROR(MDURATION('_Parameters'!$B$1,{excel_ref(excel_df, 'Maturity', i+2)},{excel_ref(excel_df, 'kupon %', i+2)},{excel_ref(excel_df, 'y mbi jual', i+2)},2,1),\"\")"
                         for i in range(len(excel_df))
                     ]
 
@@ -555,6 +675,7 @@ if uploaded_file is not None:
                     params_sheet = writer.book.create_sheet("_Parameters")
                     params_sheet["A1"] = "settlement_date"
                     params_sheet["B1"] = pd.to_datetime(settlement_date).date()
+                    params_sheet["B1"].number_format = "m/d/yyyy"
                     params_sheet.sheet_state = "hidden"
                 
                 st.download_button(
