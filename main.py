@@ -1,713 +1,114 @@
-import streamlit as st
-import streamlit.components.v1 as components
 import pdfplumber
 import pandas as pd
-import io
-import html
-import re
-import numpy_financial as npf
-from openpyxl.utils import get_column_letter
+import streamlit as st
+
+from calculations import add_simulation_columns
+from data_processing import prepare_bond_dataframe
+from excel_export import build_excel_buffer
+from pdf_parsers import extract_pdf_dataframe
+from ui_components import (
+    render_copy_table,
+    render_styled_table,
+    render_yield_curve,
+)
 
 
-USD_PREFIXES = ("INDON", "INDOIS")
-BENCHMARK_FONT_FAMILY = "arialblack"
-SYARIAH_PREFIXES = ("PBS", "SR", "ST", "INDOIS")
-
-
-def normalize_column_name(col, idx):
-    if pd.isna(col):
-        return f"_unnamed_{idx}"
-
-    name = str(col).replace("\n", "").replace("\r", "").strip()
-    return name or f"_unnamed_{idx}"
-
-
-def normalize_columns(columns):
-    normalized = []
-    seen = {}
-
-    for idx, col in enumerate(columns, start=1):
-        name = normalize_column_name(col, idx)
-        seen[name] = seen.get(name, 0) + 1
-        if seen[name] > 1:
-            name = f"{name}_{seen[name]}"
-        normalized.append(name)
-
-    return normalized
-
-
-def drop_repeated_header_rows(df):
-    normalized_headers = [str(c).strip().lower() for c in df.columns]
-
-    def looks_like_header(row):
-        row_values = [str(v).replace("\n", "").replace("\r", "").strip().lower() for v in row.tolist()]
-        return row_values == normalized_headers
-
-    return df[~df.apply(looks_like_header, axis=1)].reset_index(drop=True)
-
-
-def clean_numeric(val):
-    if pd.isna(val) or val == "":
-        return val
-
-    if not isinstance(val, str):
-        try:
-            return float(val)
-        except (TypeError, ValueError):
-            return val
-
-    s = re.sub(r"\s+", "", val.strip())
-    if s in ("", "-"):
-        return val
-
-    is_percent = "%" in s
-    s = s.replace("%", "")
-
-    if not all(c in "0123456789.,-" for c in s):
-        return val
-
-    if "," in s and "." in s:
-        if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            s = s.replace(",", "")
-    elif "," in s:
-        if s.count(",") > 1:
-            s = s.replace(",", "")
-        else:
-            parts = s.split(",")
-            if len(parts[-1]) == 3:
-                s = s.replace(",", "")
-            else:
-                s = s.replace(",", ".")
-
-    try:
-        v = float(s)
-        return v / 100.0 if is_percent else v
-    except ValueError:
-        return val
-
-
-def classify_currency(product_code):
-    if not isinstance(product_code, str):
-        return "IDR"
-
-    code = product_code.strip().upper()
-    return "USD" if code.startswith(USD_PREFIXES) else "IDR"
-
-
-def currency_matches(series, currency):
-    if currency in ("US", "USD"):
-        return series.isin(["US", "USD"])
-    return series == currency
-
-
-def product_code_key(product_code):
-    return str(product_code).strip().upper()
-
-
-def is_benchmark_font(fontname):
-    font = str(fontname).replace("-", "").replace("_", "").lower()
-    return BENCHMARK_FONT_FAMILY in font
-
-
-def extract_bold_product_codes(pdf):
-    bold_codes = set()
-
-    for page in pdf.pages:
-        try:
-            words = page.extract_words(extra_attrs=["fontname"])
-        except Exception:
-            continue
-
-        for word in words:
-            text = str(word.get("text", "")).strip()
-            fontname = str(word.get("fontname", ""))
-
-            if not text or not is_benchmark_font(fontname):
-                continue
-            if text.lower() == "product_code" or word.get("top", 0) < 120:
-                continue
-            if word.get("x0", 999) > 100 or not re.search(r"[A-Za-z]", text):
-                continue
-
-            bold_codes.add(product_code_key(text))
-
-    return bold_codes
-
-
-def product_options_for_currency(df, currency):
-    if currency == "Semua" or "currency check" not in df.columns:
-        source_df = df
-    else:
-        source_df = df[currency_matches(df["currency check"], currency)]
-
-    return source_df["product_code"].dropna().unique().tolist()
-
-
-def classify_bond_type(product_code):
-    code = product_code_key(product_code)
-    return "Syariah" if code.startswith(SYARIAH_PREFIXES) else "Konvensional"
-
-
-def product_options_for_segment(df, currency, bond_type):
-    products = product_options_for_currency(df, currency)
-    return [product for product in products if classify_bond_type(product) == bond_type]
-
-
-def auto_benchmark_products(df, bold_product_codes, currency, bond_type=None):
-    return [
-        product
-        for product in product_options_for_currency(df, currency)
-        if product_code_key(product) in bold_product_codes
-        and (bond_type is None or classify_bond_type(product) == bond_type)
-    ]
-
-
-def to_percent_str(val):
-    try:
-        if pd.isna(val):
-            return None
-        return f"{round(float(val), 6)}%"
-    except (TypeError, ValueError):
-        return val
-
-
-def parse_percent_rate(val):
-    try:
-        if pd.isna(val):
-            return None
-        return float(str(val).replace("%", "").replace(",", ".")) / 100.0
-    except (TypeError, ValueError):
-        return None
-
-
-def excel_ref(df, column_name, row_number):
-    col_idx = df.columns.get_loc(column_name) + 1
-    return f"{get_column_letter(col_idx)}{row_number}"
-
-
-def to_ql_date(date_value):
-    import QuantLib as ql
-
-    dt = pd.to_datetime(date_value)
-    return ql.Date(dt.day, dt.month, dt.year)
-
-
-def previous_coupon_date(settlement_ql, maturity_ql, frequency):
-    import QuantLib as ql
-
-    calendar = ql.NullCalendar()
-    tenor = ql.Period(frequency)
-    coupon_date = maturity_ql
-
-    while coupon_date > settlement_ql:
-        coupon_date = calendar.advance(coupon_date, -tenor, ql.Unadjusted)
-
-    return coupon_date
-
-
-def calculate_mduration(maturity_date, settlement_date, coupon_rate, yield_rate):
-    try:
-        import QuantLib as ql
-
-        maturity_dt = pd.to_datetime(maturity_date)
-        settlement_dt = pd.to_datetime(settlement_date)
-        if pd.isna(maturity_dt) or pd.isna(settlement_dt) or maturity_dt <= settlement_dt:
-            return None
-
-        settlement_ql = to_ql_date(settlement_dt)
-        maturity_ql = to_ql_date(maturity_dt)
-        frequency = ql.Semiannual
-        effective_ql = previous_coupon_date(settlement_ql, maturity_ql, frequency)
-
-        schedule = ql.Schedule(
-            effective_ql,
-            maturity_ql,
-            ql.Period(frequency),
-            ql.NullCalendar(),
-            ql.Unadjusted,
-            ql.Unadjusted,
-            ql.DateGeneration.Backward,
-            False,
-        )
-        day_count = ql.ActualActual(ql.ActualActual.ISMA, schedule)
-
-        ql.Settings.instance().evaluationDate = settlement_ql
-        bond = ql.FixedRateBond(0, 100.0, schedule, [coupon_rate], day_count)
-        interest_rate = ql.InterestRate(yield_rate, day_count, ql.Compounded, frequency)
-
-        return round(ql.BondFunctions.duration(bond, interest_rate, ql.Duration.Modified, settlement_ql), 4)
-    except Exception:
-        return None
-
-# Konfigurasi agar halaman tampil full-width (lebar penuh)
 st.set_page_config(layout="wide", page_title="PDF Table Extractor & Editor")
-
 st.title("PDF Table Extractor & Editor")
 
-uploaded_file = st.file_uploader("Unggah file PDF Excel", type="pdf")
 
+def render_simulation_inputs():
+    st.write("---")
+    st.subheader("Pengaturan Parameter Simulasi")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        settlement_date = st.date_input("Tanggal Settlement ($Y$4)", value=pd.to_datetime("today"))
+    with col2:
+        cut_rate_input = st.number_input(
+            "Cut / Hike Rate (%)",
+            value=0.2500,
+            step=0.0100,
+            format="%.4f",
+        )
+    with col3:
+        base_date_input = st.date_input("Tanggal Basis (Hari Ini)", value=pd.to_datetime("today"))
+    with col4:
+        yield_hike_input = st.number_input(
+            "Yield Naik (%)",
+            value=0.0,
+            step=0.0100,
+            format="%.4f",
+        )
+    with col5:
+        yield_cut_input = st.number_input(
+            "Yield Turun (%)",
+            value=0.0,
+            step=0.0100,
+            format="%.4f",
+        )
+
+    return {
+        "settlement_date": settlement_date,
+        "cut_rate_input": cut_rate_input,
+        "base_date_input": base_date_input,
+        "yield_hike_input": yield_hike_input,
+        "yield_cut_input": yield_cut_input,
+    }
+
+
+def render_download_button(edited_df, params):
+    excel_data = build_excel_buffer(
+        edited_df,
+        params["settlement_date"],
+        params["cut_rate_input"],
+        params["yield_hike_input"],
+        params["yield_cut_input"],
+    )
+
+    st.download_button(
+        label="Unduh Data (Excel)",
+        data=excel_data,
+        file_name="hasil_edit.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def process_uploaded_pdf(uploaded_file):
+    with pdfplumber.open(uploaded_file) as pdf:
+        raw_df, benchmark_product_codes = extract_pdf_dataframe(pdf)
+
+    if raw_df.empty:
+        st.warning("Tabel tidak terdeteksi pada PDF ini.")
+        return
+
+    df, maturity_col = prepare_bond_dataframe(raw_df)
+    if "y mbi jual" in df.columns and df["y mbi jual"].isna().all():
+        st.warning("Kolom yield_mbi_jual tidak ditemukan; simulasi yield dan grafik akan kosong.")
+
+    params = render_simulation_inputs()
+    df = add_simulation_columns(
+        df,
+        maturity_col,
+        params["settlement_date"],
+        params["cut_rate_input"],
+        params["base_date_input"],
+        params["yield_hike_input"],
+        params["yield_cut_input"],
+    )
+
+    st.write("Edit data langsung pada tabel di bawah:")
+    edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
+
+    render_styled_table(edited_df)
+    render_copy_table(edited_df)
+    render_yield_curve(edited_df, benchmark_product_codes)
+    render_download_button(edited_df, params)
+
+
+uploaded_file = st.file_uploader("Unggah file PDF Excel", type="pdf")
 if uploaded_file is not None:
     try:
-        with pdfplumber.open(uploaded_file) as pdf:
-            all_rows = []
-            benchmark_product_codes = extract_bold_product_codes(pdf)
-            
-            # Ekstrak tabel dari semua halaman
-            for page in pdf.pages:
-                table = page.extract_table()
-                if table:
-                    all_rows.extend(table)
-            
-            if all_rows:
-                # Jadikan baris pertama sebagai header
-                header = all_rows[0]
-                data = all_rows[1:]
-                
-                df = pd.DataFrame(data, columns=header)
-                
-                # Bersihkan nama kolom dari karakter 'enter' dan beri nama aman untuk kolom kosong.
-                df.columns = normalize_columns(df.columns)
-                df = drop_repeated_header_rows(df)
-                
-                # Tambah kolom kustom di sebelah kanan tabel
-                
-                # --- PEMBERSIHAN DATA DAN KONVERSI TIPE ---
-                # Konversi semua kolom numerik utama agar jadi float asli
-                numeric_candidates = ['kupon', 'mbi_beli', 'mbi_jual', 'yield_mbi_beli', 'yield_mbi_jual', 'Inventory']
-                for c in numeric_candidates:
-                    if c in df.columns:
-                        df[c] = df[c].apply(clean_numeric)
-                
-                # Konversi kolom tanggal ke Datetime
-                date_candidates = ['Maturity', 'Settlement date']
-                for c in date_candidates:
-                    if c in df.columns:
-                        df[c] = pd.to_datetime(df[c], errors='coerce').dt.strftime('%d-%m-%Y')  # Keep only dd mm yyyy format (no hour); invalid values become NaN.
-                        
-
-                # 1. Currency Check
-                if 'product_code' in df.columns:
-                    df['currency check'] = df['product_code'].apply(classify_currency)
-                
-                # 2. Year Maturity
-                maturity_col = next((col for col in df.columns if pd.notna(col) and 'maturity' in str(col).lower()), None)
-                if maturity_col:
-                    def extract_year(date_val):
-                        if pd.isna(date_val): return ''
-                        if isinstance(date_val, pd.Timestamp): return str(date_val.year)
-                        match = re.search(r'((?:19|20)\d{2})', str(date_val))
-                        return match.group(1) if match else str(date_val)
-                    df['year maturity'] = df[maturity_col].apply(extract_year)
-                
-                # 3, 4, 5. Kolom Persentase (Kupon %, Y MBI Beli, Y MBI Jual)
-                if 'kupon' in df.columns:
-                    df['kupon %'] = df['kupon'].apply(to_percent_str)
-                    df.drop(columns=['kupon', 'Settlement date', '_unnamed_4'], inplace=True)
-                else:
-                    df['kupon %'] = None
-                
-                if 'yield_mbi_beli' in df.columns:
-                    df['y mbi beli'] = df['yield_mbi_beli'].apply(to_percent_str)
-                    df.drop(columns=['yield_mbi_beli'], inplace=True)
-                
-                if 'yield_mbi_jual' in df.columns:
-                    df['y mbi jual'] = df['yield_mbi_jual'].apply(to_percent_str)
-                    df.drop(columns=['yield_mbi_jual'], inplace=True)
-                else:
-                    df['y mbi jual'] = None
-                    st.warning("Kolom yield_mbi_jual tidak ditemukan; simulasi yield dan grafik akan kosong.")
-                
-                # 6. Kolom MDURATION 
-                st.write("---")
-                st.subheader("Pengaturan Parameter Simulasi")
-                
-                col1, col2, col3, col4, col5 = st.columns(5)
-                with col1:
-                    settlement_date = st.date_input("Tanggal Settlement ($Y$4)", value=pd.to_datetime("today"))
-                with col2:
-                    cut_rate_input = st.number_input("Cut / Hike Rate (%)", value=0.2500, step=0.0100, format="%.4f")
-                with col3:
-                    base_date_input = st.date_input("Tanggal Basis (Hari Ini)", value=pd.to_datetime("today"))
-                with col4:
-                    yield_hike_input = st.number_input("Yield Naik (%)", value=0.0, step=0.0100, format="%.4f")
-                with col5:
-                    yield_cut_input = st.number_input("Yield Turun (%)", value=0.0, step=0.0100, format="%.4f")
-                
-                def hitung_mduration_ql(row):
-                    mat_val = row.get('Maturity') if 'Maturity' in row else (row.get(maturity_col) if maturity_col else None)
-                    kup_val = row.get('kupon %')
-                    yld_val = row.get('y mbi jual')
-
-                    if pd.isna(mat_val) or pd.isna(kup_val) or pd.isna(yld_val):
-                        return None
-
-                    coupon_rate = parse_percent_rate(kup_val)
-                    yield_rate = parse_percent_rate(yld_val)
-                    if coupon_rate is None or yield_rate is None:
-                        return None
-
-                    return calculate_mduration(mat_val, settlement_date, coupon_rate, yield_rate)
-
-                df['MDURATION'] = df.apply(hitung_mduration_ql, axis=1)
-
-                # 7 & 8. Kolom Rate Hike & Rate Cut
-                def hitung_rate_impact(val, is_hike=False):
-                    try:
-                        if pd.isna(val): return None
-                        v = parse_percent_rate(val)
-                        if v is None:
-                            return None
-                        
-                        result = v * (cut_rate_input / 100.0) 
-                        if is_hike:
-                            result = -result 
-                            
-                        return round(result, 6)
-                    except Exception:
-                        return None
-                        
-                df['Rate Hike'] = df['y mbi jual'].apply(lambda x: hitung_rate_impact(x, is_hike=True))
-                df['Rate Cut'] = df['y mbi jual'].apply(lambda x: hitung_rate_impact(x, is_hike=False))
-
-                if 'mbi_jual' in df.columns:
-                    mbi_jual_num = pd.to_numeric(df['mbi_jual'], errors='coerce')
-                    df['Rate Hike Price'] = mbi_jual_num + (df['Rate Hike'] * mbi_jual_num)
-                    df['Rate Cut Price'] = mbi_jual_num + (df['Rate Cut'] * mbi_jual_num)
-                else:
-                    df['Rate Hike Price'] = None
-                    df['Rate Cut Price'] = None
-                
-                base_date_pd = pd.to_datetime(base_date_input)
-                
-                # Kolom Total Year to Maturity
-                def hitung_ytm_years(row):
-                    mat = row.get('Maturity') if 'Maturity' in row else row.get(maturity_col)
-                    if pd.isna(mat): return None
-                    try:
-                        diff = (pd.to_datetime(mat) - base_date_pd.normalize()).days / 365.25
-                        return round(diff, 4)
-                    except:
-                        return None
-                        
-                df['Total Year to Maturity'] = df.apply(hitung_ytm_years, axis=1)
-                
-                # Kolom Price menggunakan formula PV
-                def hitung_price_pv(row, is_hike=True):
-                    try:
-                        y_mbi = parse_percent_rate(row.get('y mbi jual'))
-                        kupon = parse_percent_rate(row.get('kupon %'))
-                        ytm_years = row.get('Total Year to Maturity')
-                        
-                        if pd.isna(y_mbi) or pd.isna(kupon) or pd.isna(ytm_years):
-                            return None
-                        
-                        if is_hike:
-                            rate = y_mbi + (yield_hike_input / 100.0)
-                        else:
-                            rate = y_mbi - (yield_cut_input / 100.0)
-                            
-                        nper = ytm_years
-                        pmt = 100 * kupon
-                        fv = 100
-                        
-                        price = -npf.pv(rate, nper, pmt, fv, when=0)
-                        return round(price, 4)
-                    except Exception:
-                        return None
-                        
-                df['Price if Yield Hike'] = df.apply(lambda r: hitung_price_pv(r, is_hike=True), axis=1)
-                df['Price if Yield Cut'] = df.apply(lambda r: hitung_price_pv(r, is_hike=False), axis=1)
-
-                st.write("Edit data langsung pada tabel di bawah:")
-                
-                # Memastikan tabel memanfaatkan seluruh lebar kontainer
-                edited_df = st.data_editor(df, num_rows="dynamic", use_container_width=True)
-
-                # --- TAMPILAN WARNA TABEL ---
-                st.write("Tabel dengan gradasi warna:")
-                col1, col2 = st.columns([1, 3])
-                with col1:
-                    price_threshold = st.number_input("Threshold Price", value=100.0, step=1.0)
-                with col2:
-                    usd_idr_filter = st.selectbox("Filter Mata Uang untuk Bonds:", options=["Semua", "IDR", "USD"], index=0)
-                
-                year_col = next((c for c in edited_df.columns if "year" in str(c).lower()), None)
-
-                styled_df = edited_df.copy()
-                
-                # Apply Filter  
-                if usd_idr_filter == "USD":
-                    styled_df = styled_df[styled_df['currency check'] == 'USD']
-                elif usd_idr_filter == "IDR":
-                    styled_df = styled_df[styled_df['currency check'] == 'IDR']
-                else:
-                    pass  # Semua, tidak perlu filter
-                
-                # Convert mbi_jual ke numeric untuk pengecekan threshold
-                styled_df['mbi_jual'] = pd.to_numeric(styled_df['mbi_jual'], errors='coerce')
-                
-                # Tampilkan produk yang dibawah threshold saja
-                styled_df = styled_df[styled_df['mbi_jual'] <= price_threshold]
-
-                styler = styled_df.style
-
-                if year_col:
-                    styler = styler.background_gradient(
-                        subset=[year_col],
-                        cmap="Blues",
-                        gmap=pd.to_numeric(styled_df[year_col], errors="coerce")
-                    )
-
-                # Gelapkan sel numerik lain dengan gradasi abu-abu agar kontras lebih tinggi.
-                # numeric_cols = [
-                #     c for c in styled_df.columns
-                #     if c != year_col and pd.api.types.is_numeric_dtype(styled_df[c])
-                # ]
-                # if numeric_cols:
-                #     styler = styler.background_gradient(
-                #         subset=numeric_cols,
-                #         cmap="Greys"
-                #     )
-                    
-                st.dataframe(styler, use_container_width=True, hide_index=True)
-
-                # --- COPY TABLE (PRODUCT_CODE SAMPAI INVENTORY) ---
-                copy_cols = []
-                if "product_code" in edited_df.columns and "Inventory" in edited_df.columns:
-                    start_idx = edited_df.columns.get_loc("product_code")
-                    end_idx = edited_df.columns.get_loc("Inventory")
-                    if start_idx <= end_idx:
-                        copy_cols = edited_df.columns[start_idx:end_idx + 1].tolist()
-
-                if copy_cols:
-                    copy_df = edited_df[copy_cols].copy()
-                    copy_text = copy_df.to_csv(index=False, sep="\t")
-                    escaped_copy_text = html.escape(copy_text)
-                    st.write("Copy tabel (kolom product_code sampai Inventory):")
-                    components.html(
-                        f"""
-                        <div style='display:flex; gap:8px; align-items:center;'>
-                          <button onclick='navigator.clipboard.writeText(document.getElementById("copy_area").value)'>Copy Table</button>
-                          <span id='copy_status' style='font-size:12px; color:#333;'></span>
-                        </div>
-                        <textarea id='copy_area' style='width:100%; height:160px; margin-top:8px;'>{escaped_copy_text}</textarea>
-                        <script>
-                          const btn = document.querySelector('button');
-                          const status = document.getElementById('copy_status');
-                          btn.addEventListener('click', () => {{
-                            status.textContent = 'Copied';
-                            setTimeout(() => status.textContent = '', 1500);
-                          }});
-                        </script>
-                        """,
-                        height=230,
-                    )
-                else:
-                    st.info("Kolom product_code atau Inventory tidak ditemukan untuk fitur copy.")
-
-                excel_df = edited_df.copy()
-
-                # --- VISUALISASI YIELD CURVE BENCHMARK ---
-                st.write("---")
-                
-                if 'product_code' in edited_df.columns and 'year maturity' in edited_df.columns and 'y mbi jual' in edited_df.columns:
-                    bold_product_codes = benchmark_product_codes
-                    
-                    if 'currency check' in edited_df.columns:
-                        available_currencies = ["Semua"] + edited_df['currency check'].dropna().unique().tolist()
-                        selected_currency = st.radio("Filter Mata Uang Grafik:", options=available_currencies, horizontal=True)
-                    else:
-                        selected_currency = "Semua"
-
-                    chart_title = f"Bonds Chart {selected_currency if selected_currency != 'Semua' else ''} - Mark to Market".replace("  ", " ")
-                    st.subheader(chart_title)
-                    
-                    filtered_df_for_chart = edited_df.copy()
-                    if selected_currency != "Semua" and 'currency check' in filtered_df_for_chart.columns:
-                        filtered_df_for_chart = filtered_df_for_chart[currency_matches(filtered_df_for_chart['currency check'], selected_currency)]
-                        
-                    valid_products = filtered_df_for_chart['product_code'].dropna().unique().tolist()
-
-                    benchmark_inputs = []
-                    if selected_currency in ("Semua", "IDR"):
-                        benchmark_inputs = [
-                            (
-                                "Benchmark IDR Konvensional",
-                                product_options_for_segment(edited_df, "IDR", "Konvensional"),
-                                auto_benchmark_products(edited_df, bold_product_codes, "IDR", "Konvensional"),
-                                "red",
-                            ),
-                            (
-                                "Benchmark IDR Syariah",
-                                product_options_for_segment(edited_df, "IDR", "Syariah"),
-                                auto_benchmark_products(edited_df, bold_product_codes, "IDR", "Syariah"),
-                                "green",
-                            ),
-                        ]
-                    if selected_currency in ("Semua", "USD", "US"):
-                        benchmark_inputs.append(
-                            (
-                                "Benchmark USD",
-                                product_options_for_currency(edited_df, "USD"),
-                                auto_benchmark_products(edited_df, bold_product_codes, "USD"),
-                                "orange",
-                            )
-                        )
-
-                    benchmark_configs = []
-                    if benchmark_inputs:
-                        bench_cols = st.columns(len(benchmark_inputs))
-                        for idx, (label, options, default, color) in enumerate(benchmark_inputs):
-                            with bench_cols[idx]:
-                                benchmark_selection = st.multiselect(
-                                    f"Pilih Seri Obligasi {label}",
-                                    options=options,
-                                    default=default,
-                                    key=f"benchmark_selection_{idx}_{selected_currency}",
-                                )
-                                benchmark_configs.append((label, benchmark_selection, color))
-                    
-                    chart_df = filtered_df_for_chart.copy()
-                    chart_df['Year Numeric'] = pd.to_numeric(chart_df['year maturity'], errors='coerce')
-                    
-                    def parse_yield_chart(val):
-                        try:
-                            return float(str(val).replace('%', '').replace(',', '.'))
-                        except:
-                            return None
-                    chart_df['Yield Numeric'] = chart_df['y mbi jual'].apply(parse_yield_chart)
-                    
-                    chart_df = chart_df.dropna(subset=['Year Numeric', 'Yield Numeric'])
-                    
-                    if not chart_df.empty:
-                        import plotly.graph_objects as go
-                        
-                        fig = go.Figure()
-                        
-                        # 1. Scatter Plot
-                        fig.add_trace(go.Scatter(
-                            x=chart_df['Year Numeric'],
-                            y=chart_df['Yield Numeric'],
-                            mode='markers+text',
-                            name='Seri Bonds',
-                            text=chart_df['product_code'],
-                            textposition="top right",
-                            marker=dict(size=8, color='#5D9CEC'),
-                            textfont=dict(color='black', size=10) 
-                        ))
-                        
-                        # 2. Line Plot (Benchmark Curves)
-                        summary_tables = []
-                        for bench_name, selected_products, color in benchmark_configs:
-                            if not selected_products:
-                                continue
-
-                            bench_df = chart_df[chart_df['product_code'].isin(selected_products)].copy()
-                            bench_df = bench_df.sort_values(by='Year Numeric')
-
-                            fig.add_trace(go.Scatter(
-                                x=bench_df['Year Numeric'],
-                                y=bench_df['Yield Numeric'],
-                                mode='lines+markers',
-                                name=f'{bench_name} Curve',
-                                line=dict(color=color, width=3),
-                                marker=dict(size=10, color=color)
-                            ))
-
-                            summary_df = bench_df[['product_code', 'year maturity', 'y mbi jual']].copy()
-                            summary_df.columns = [bench_name, 'Year', 'Yield']
-                            summary_tables.append((bench_name, summary_df))
-
-                        if summary_tables:
-                            st.write("**Tabel Ringkasan Benchmark**")
-                            summary_cols = st.columns(len(summary_tables))
-                            for idx, (bench_name, summary_df) in enumerate(summary_tables):
-                                with summary_cols[idx]:
-                                    st.write(f"**{bench_name}**")
-                                    st.dataframe(summary_df, hide_index=True, use_container_width=True)
-                            
-                        # Layout Diperbaiki agar rapi saat ditarik full layar
-                        fig.update_layout(
-                            xaxis_title="Year",
-                            yaxis_title="Yield (% MBI Jual)",
-                            hovermode="closest",
-                            yaxis=dict(tickformat=".2f", ticksuffix="%"),
-                            height=600,
-                            plot_bgcolor='white',
-                            showlegend=True,
-                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), # Legenda diletakkan di atas
-                            margin=dict(l=20, r=20, t=40, b=20)
-                        )
-                        
-                        fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
-                        fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
-                        
-                        st.plotly_chart(fig, use_container_width=True)
-                
-                # --- PERSIAPAN DOWNLOAD EXCEL ---
-                def clean_for_excel(val):
-                    parsed = parse_percent_rate(val)
-                    return parsed if parsed is not None else val
-                        
-                for c in ['kupon %', 'y mbi beli', 'y mbi jual']:
-                    if c in excel_df.columns:
-                        excel_df[c] = excel_df[c].apply(clean_for_excel)
-                
-                if {'Maturity', 'kupon %', 'y mbi jual'}.issubset(excel_df.columns):
-                    excel_df['MDURATION'] = [
-                        f"=IFERROR(MDURATION('_Parameters'!$B$1,{excel_ref(excel_df, 'Maturity', i+2)},{excel_ref(excel_df, 'kupon %', i+2)},{excel_ref(excel_df, 'y mbi jual', i+2)},2,1),\"\")"
-                        for i in range(len(excel_df))
-                    ]
-
-                if 'y mbi jual' in excel_df.columns:
-                    excel_df['Rate Hike'] = [
-                        f"=-{excel_ref(excel_df, 'y mbi jual', i+2)}*{cut_rate_input/100.0}"
-                        for i in range(len(excel_df))
-                    ]
-                    excel_df['Rate Cut'] = [
-                        f"={excel_ref(excel_df, 'y mbi jual', i+2)}*{cut_rate_input/100.0}"
-                        for i in range(len(excel_df))
-                    ]
-
-                if {'mbi_jual', 'Rate Hike', 'Rate Cut'}.issubset(excel_df.columns):
-                    excel_df['Rate Hike Price'] = [
-                        f"={excel_ref(excel_df, 'mbi_jual', i+2)}+({excel_ref(excel_df, 'Rate Hike', i+2)}*{excel_ref(excel_df, 'mbi_jual', i+2)})"
-                        for i in range(len(excel_df))
-                    ]
-                    excel_df['Rate Cut Price'] = [
-                        f"={excel_ref(excel_df, 'mbi_jual', i+2)}+({excel_ref(excel_df, 'Rate Cut', i+2)}*{excel_ref(excel_df, 'mbi_jual', i+2)})"
-                        for i in range(len(excel_df))
-                    ]
-                
-                if {'y mbi jual', 'Total Year to Maturity', 'kupon %'}.issubset(excel_df.columns):
-                    excel_df['Price if Yield Hike'] = [
-                        f"=-PV(({excel_ref(excel_df, 'y mbi jual', i+2)}+{yield_hike_input/100.0}),{excel_ref(excel_df, 'Total Year to Maturity', i+2)},(100*{excel_ref(excel_df, 'kupon %', i+2)}),100,0)"
-                        for i in range(len(excel_df))
-                    ]
-                    excel_df['Price if Yield Cut'] = [
-                        f"=-PV(({excel_ref(excel_df, 'y mbi jual', i+2)}-{yield_cut_input/100.0}),{excel_ref(excel_df, 'Total Year to Maturity', i+2)},(100*{excel_ref(excel_df, 'kupon %', i+2)}),100,0)"
-                        for i in range(len(excel_df))
-                    ]
-                
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                    excel_df.to_excel(writer, index=False, sheet_name='Sheet1')
-                    params_sheet = writer.book.create_sheet("_Parameters")
-                    params_sheet["A1"] = "settlement_date"
-                    params_sheet["B1"] = pd.to_datetime(settlement_date).date()
-                    params_sheet["B1"].number_format = "m/d/yyyy"
-                    params_sheet.sheet_state = "hidden"
-                
-                st.download_button(
-                    label="Unduh Data (Excel)",
-                    data=buffer.getvalue(),
-                    file_name="hasil_edit.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            else:
-                st.warning("Tabel tidak terdeteksi pada PDF ini.")
-                
-    except Exception as e:
-        st.error(f"Gagal memproses file: {e}")
+        process_uploaded_pdf(uploaded_file)
+    except Exception as exc:
+        st.error(f"Gagal memproses file: {exc}")
